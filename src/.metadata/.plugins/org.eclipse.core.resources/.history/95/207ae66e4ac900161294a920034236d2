@@ -1,0 +1,315 @@
+package trusted;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+
+import javassist.CannotCompileException;
+import javassist.NotFoundException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
+import shared.CPLock;
+import shared.TLSSessionInfo;
+import shared.TLSUtils;
+import shared.TLSUtils.TLS_State;
+import shared.Values;
+import shared.Values.Switch_mode;
+
+
+public class Trusted {
+	
+	private String host;
+	private int port;
+	private SSLTrustedEngine engine;
+	
+	private Switch_mode _switch_mode;
+	private boolean _explicit_switch;
+	
+	public Trusted(String host, int port, Values.Switch_mode switch_mode, boolean explicit_switch) throws KeyManagementException, NoSuchAlgorithmException, CertificateException, FileNotFoundException, KeyStoreException, IOException {
+		this.host = host;
+		this.port = port;
+		
+		_switch_mode = switch_mode;
+		_explicit_switch = explicit_switch;
+	}
+	
+	private TLS_State current_state = TLS_State.StateT;
+	
+	private ByteBuffer proxyBuffer = ByteBuffer.allocate(Values.BIG_BUFFER_SIZE);
+	private ByteBuffer commdBuffer = ByteBuffer.allocate(Values.BUFFER_SIZE);
+	
+	private CPLock proxyLock = new CPLock();
+	private CPLock commdLock = new CPLock();
+	
+	private Socket proxySocket;
+	
+	public void start(String serverHost, int serverPort) throws UnknownHostException, IOException, NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, InvocationTargetException, InterruptedException, KeyManagementException, NoSuchAlgorithmException, CertificateException, KeyStoreException, ClassNotFoundException, IllegalBlockSizeException, BadPaddingException, NotFoundException, CannotCompileException {
+		
+		proxySocket = connectProxy(serverHost, serverPort);
+		InputStream proxy_io = proxySocket.getInputStream();
+		
+		TLSUtils.startReadRecordThread( proxy_io, proxyBuffer, proxyLock);
+		TLSUtils.startReadThread(System.in, commdBuffer, commdLock);
+		
+		boolean first = true;
+		
+		do {
+			
+			engine.performHandshake(proxySocket.getOutputStream(), proxyBuffer, proxyLock);
+			
+			if( first ) {
+				
+				System.out.println("Initial handshake performed.\nCommands : (s)end, state (p), state (t), (e)xit.\nCommand example : sHelloWord !");
+				first = false;
+			}
+			
+			if( current_state == TLS_State.StateP )
+				sendPartialSSLEngineToProxy();
+			else if( current_state == TLS_State.StateP2 ) {
+				sendSessionInfo();
+				current_state = TLS_State.StateP2;
+			} else
+				startProxyThread();
+			
+			startCommandLoop();
+			joinProxyThread();
+			
+			if( current_state == TLS_State.StateT )
+				updateEngineState();
+			else if(current_state == TLS_State.StateT2){
+				updateSeqNum();
+			}
+			
+		} while( current_state != TLS_State.Close );
+		
+		TLSUtils.joinReadThreads();
+		
+		sendShutdownToProxy();
+		
+		proxySocket.close();
+	}
+	
+	private void sendSessionInfo() throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, IOException {
+		
+		SSLEngine internal_engine = engine.getInternalSSLEngine();
+		TLSSessionInfo sessionInfo = engine.getHandshakerCallback().getSessionInfo();
+		sessionInfo.extractSeqNums(internal_engine);
+		
+		int len = sessionInfo.length();
+		byte [] buffer = new byte[TLSUtils.TLS_HEADER_SIZE + len];
+		buffer[0] = 'P';
+		TLSUtils.writeSizeToRecordHeader(buffer, len);
+		TLSUtils.writeTLSVersionToRecordHeader(buffer, sessionInfo.protocolVersion() );
+		sessionInfo.toBytes(buffer, TLSUtils.TLS_HEADER_SIZE, len);
+		
+		proxySocket.getOutputStream().write(buffer);
+
+		System.out.println("Sent " + TLSUtils.TLS_HEADER_SIZE + "+" + len + "="+ (len+TLSUtils.TLS_HEADER_SIZE)+" bytes to proxy.");
+	}
+
+	private void updateSeqNum() throws InterruptedException, NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+		
+		proxyLock.waitWork();
+		
+		assert  proxyBuffer.get(0) == 'T';
+		
+		int size = TLSUtils.readSizeFromRecordHeader(proxyBuffer);
+		
+		byte [] data = new byte[size];
+		
+		proxyBuffer.get(data,0,size);
+		
+		engine.goStateT2(data, size);
+		
+		proxyLock.workFinished();
+		
+		current_state = TLS_State.StateT;
+		
+		System.out.println("Received " + TLSUtils.TLS_HEADER_SIZE + "+" + size + "="+ (size+TLSUtils.TLS_HEADER_SIZE)+" bytes from proxy.");
+		
+		System.out.println("state T2");
+	}
+
+	private Socket connectProxy(String serverHost, int serverPort) throws IOException, KeyManagementException, NoSuchAlgorithmException, CertificateException, KeyStoreException, NotFoundException, NoSuchMethodException, SecurityException, InstantiationException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, CannotCompileException, NoSuchFieldException {
+
+		Socket proxySocket = new Socket(host, port);
+		
+		OutputStream oo = proxySocket.getOutputStream();
+		
+		String dest = serverHost + ":" + Integer.toString(serverPort);
+		byte [] toSend = dest.getBytes( StandardCharsets.UTF_8);
+		
+		oo.write(toSend.length);
+		oo.write(toSend);
+		
+		engine = new SSLTrustedEngine(serverHost, serverPort, _switch_mode);
+		
+		return proxySocket;
+	}
+
+	private Thread proxyThread;
+
+	private void startProxyThread() {
+		
+		proxyThread = new Thread() {
+			
+			@Override
+			public void run() {
+				
+				while( true ) {
+					
+					try {
+						proxyLock.waitWork();
+					} catch (InterruptedException e) {
+						break;
+					}
+					
+					try {
+						engine.receive(System.out, proxyBuffer);
+					} catch (SSLException e) {
+						e.printStackTrace();
+						assert false;
+					}
+					
+					proxyLock.workFinished();
+				}
+			}
+		};
+		
+		proxyThread.start();
+	}
+	
+	private void joinProxyThread() throws InterruptedException {
+		
+		proxyThread.interrupt();
+		proxyThread.join();
+	}
+	
+	private byte [] STATE_T_MESSAGE = {'t', 0,0,0,0};
+	private byte [] STATE_T2_MESSAGE = {'T', 0,0,0,0};
+	
+	private void startCommandLoop() throws IOException, InterruptedException {
+		
+		byte commdType = 's';
+		
+		do {
+			
+			commdLock.waitWork();
+			
+			if(_explicit_switch) {
+				
+			} else {
+				
+				commdType = commdBuffer.get();
+				
+				switch( commdType ) {
+				case 'p':
+				case 'P':
+					
+					if( current_state != TLS_State.StateT)
+						System.out.println("Need to be in state T");
+					
+					if( _switch_mode != Switch_mode.choose)
+						current_state = ( _switch_mode == Switch_mode.naive ? TLS_State.StateP : TLS_State.StateP2 );
+					else
+						current_state = ( commdType == 'p' ? TLS_State.StateP : TLS_State.StateP2);
+					
+				case 't':
+				case 'T':
+					
+					
+					if( current_state != TLS_State.StateP)
+						System.out.println("Need to be in state P");
+					
+					
+					if( _switch_mode != Switch_mode.choose)
+						current_state = ( _switch_mode == Switch_mode.naive ? TLS_State.StateT : TLS_State.StateT2 );
+					else
+						current_state = ( commdType == 'p' ? TLS_State.StateT : TLS_State.StateT2);
+					
+					proxySocket.getOutputStream().write( current_state == TLS_State.StateT ? STATE_T_MESSAGE : STATE_T2_MESSAGE);
+					
+					break;
+					
+				case 's':
+					if( current_state != TLS_State.StateT)
+						System.out.println("Need to be in state T");
+					else
+						engine.send(proxySocket.getOutputStream(), commdBuffer);
+					break;
+				case 'e':
+					current_state = TLS_State.Close;
+					break;
+				default :
+					assert false : "Unkown commande " + commdType;
+					commdType = 's';
+					break;
+				}
+			}
+			commdLock.workFinished();
+			
+		} while(commdType == 's');
+	}
+	
+
+	private static byte [] STATE_P_HEADER = {'p', '0', '0', '0', '0'};
+	
+	private void sendPartialSSLEngineToProxy() throws IOException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, NoSuchFieldException {
+		
+		byte [] data = engine.goStateP();
+		
+		TLSUtils.writeSizeToRecordHeader(STATE_P_HEADER, data.length);
+		
+		OutputStream oo = proxySocket.getOutputStream();
+		oo.write(STATE_P_HEADER, 0, STATE_P_HEADER.length);
+		oo.write(data, 0, data.length);
+		
+		System.out.println("Sent " + TLSUtils.TLS_HEADER_SIZE + "+" + data.length + "="+ (data.length+TLSUtils.TLS_HEADER_SIZE)+" bytes to proxy.");
+		
+	}
+	
+	final private static byte [] SHUTDOWN_MESSAGE = {'e', '0', '0', '0', '0'};
+	
+	private void sendShutdownToProxy() throws IOException {
+		
+		OutputStream oo = proxySocket.getOutputStream();
+		oo.write(SHUTDOWN_MESSAGE, 0, SHUTDOWN_MESSAGE.length);
+		oo.flush();
+	}
+	
+	
+	private void updateEngineState() throws IOException, InterruptedException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, ClassNotFoundException, IllegalBlockSizeException, BadPaddingException, NoSuchFieldException {
+		
+		proxyLock.waitWork();
+		
+		assert  proxyBuffer.get(0) == 't';
+		
+		int size = TLSUtils.readSizeFromRecordHeader(proxyBuffer);
+
+		System.out.println("Received " + TLSUtils.TLS_HEADER_SIZE + "+" + size + "="+ (size+TLSUtils.TLS_HEADER_SIZE)+" bytes from proxy.");
+		
+		byte [] data = new byte[size];
+		
+		proxyBuffer.get(data,0,size);
+		
+		engine.goStateT(data, size);
+		
+		proxyLock.workFinished();
+		
+		current_state = TLS_State.StateT;
+		
+		System.out.println("State T");
+	}
+}

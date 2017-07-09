@@ -1,0 +1,80 @@
+package agent;
+
+import java.lang.instrument.ClassFileTransformer;
+import java.lang.instrument.IllegalClassFormatException;
+import java.security.ProtectionDomain;
+
+import javassist.CannotCompileException;
+import javassist.ClassPool;
+import javassist.CtClass;
+import javassist.CtField;
+import javassist.CtMethod;
+import javassist.NotFoundException;
+
+public class HandshakerTransformer implements ClassFileTransformer {
+	
+    public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
+            ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
+     
+    		byte[] byteCode = classfileBuffer;
+    		
+    		if (className.equals("sun/security/ssl/Handshaker")) {
+                try {
+                	
+                    ClassPool cp = ClassPool.getDefault();
+                    CtClass cc = cp.get("sun.security.ssl.Handshaker");
+                    
+                    addCallback(cc, "newReadMAC", Position.BEFORE);
+                    addCallback(cc, "newReadCipher", Position.BEFORE);
+                    
+
+                    addCallback(cc, "newWriteMAC", Position.BEFORE);
+                    addCallback(cc, "newWriteCipher", Position.BEFORE);
+                    
+                    byteCode = cc.toBytecode();
+                    cc.detach();
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            }
+    		
+    		if (className.equals("sun/security/ssl/SSLEngineImpl")) {
+                try {
+                	
+                    ClassPool cp = ClassPool.getDefault();
+                    CtClass cc = cp.get("sun.security.ssl.SSLEngineImpl");
+                    
+                    addCallback(cc, "changeReadCiphers", Position.AFTER);
+                    addCallback(cc, "changeWriteCiphers", Position.AFTER);
+                    
+                    byteCode = cc.toBytecode();
+                    cc.detach();
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            }
+     
+            return byteCode;
+        }
+    
+    	private enum Position {BEFORE, AFTER};
+    
+    	private void addCallback(CtClass cc, String method_name, Position position) throws CannotCompileException, NotFoundException {
+    		
+    		String strpos = (position == Position.BEFORE ? "before" : "after");
+    		
+    		cc.addField( CtField.make("private java.lang.Runnable _"+strpos+"_"+method_name+" = null;", cc) );
+            
+            CtMethod m = cc.getDeclaredMethod(method_name);
+            
+            String strInstructions = "{if(_"+strpos+"_"+method_name+" != null) _"+strpos+"_"+method_name+".run();}";
+            
+            if( position == Position.BEFORE)
+            	m.insertBefore(strInstructions);
+            else
+            	m.insertAfter(strInstructions);
+            
+            System.out.println("Inserted ");
+            	
+    	}
+}

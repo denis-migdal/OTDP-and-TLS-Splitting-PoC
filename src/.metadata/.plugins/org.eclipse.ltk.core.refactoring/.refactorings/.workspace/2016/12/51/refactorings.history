@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;TLS Split PoC&apos; to &apos;TLS Switch PoC&apos;" description="Rename resource &apos;TLS Split PoC&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="/TLS Split PoC" name="TLS Switch PoC" stamp="1482435577795" updateReferences="true"/>
+</session>

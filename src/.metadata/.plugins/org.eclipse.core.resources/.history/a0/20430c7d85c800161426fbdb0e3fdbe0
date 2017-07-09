@@ -1,0 +1,268 @@
+package trusted;
+
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import javassist.CannotCompileException;
+import javassist.NotFoundException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+import shared.CPLock;
+import shared.Introspection;
+import shared.Serialization;
+import shared.TLSUtils;
+import shared.Introspection.SSLSessionInfo;
+import shared.Serialization.Serialized;
+
+public class SSLTrustedEngine {
+
+	private SSLEngine engine = null;
+	
+	private ByteBuffer clearInput = null;
+	private ByteBuffer cipherOutput = null;
+	private ByteBuffer dummy = null;
+	
+	private boolean useTLS;
+	
+	
+
+	static public int BUFFER_SIZE = 4096;
+	static public int BIG_BUFFER_SIZE = 15*1024;
+	static public boolean USE_TLS = true;
+	static public String SSL_CONTEXT_NAME = "TLSv1.2";//"TLS";
+	static public String KEYSTORE_TYPE = "JKS";	
+	static public String TRUST_FILE = "~/.tlsswitch/trustStore";
+	static public String TRUST_FILE_PASSPHRASE = "123456";
+	static public String TRUST_NAME = "SunX509";
+	
+	
+	
+	
+	public SSLTrustedEngine(String host, int port) throws KeyManagementException, NoSuchAlgorithmException, CertificateException, FileNotFoundException, KeyStoreException, IOException, NotFoundException, CannotCompileException, NoSuchMethodException, SecurityException, InstantiationException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, NoSuchFieldException {
+
+		useTLS = Values.USE_TLS;
+		
+		if( useTLS ) {
+			
+			engine = createContext().createSSLEngine(host, port);
+			
+			engine.setUseClientMode(true);
+			
+			SSLSession session = engine.getSession();
+			int appCapacity = session.getApplicationBufferSize();
+			int netCapacity = session.getPacketBufferSize();
+	
+			cipherOutput = ByteBuffer.allocateDirect(netCapacity);
+			clearInput = ByteBuffer.allocate(appCapacity + 50);
+			dummy = ByteBuffer.allocate(0); dummy.flip();
+		}
+	}
+	
+	private SSLContext createContext() throws NoSuchAlgorithmException, CertificateException, FileNotFoundException, IOException, KeyStoreException, KeyManagementException {
+		
+		SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_NAME);
+
+		KeyStore store = KeyStore.getInstance(KEYSTORE_TYPE);
+		store.load(new FileInputStream(TRUST_FILE), TRUST_FILE_PASSPHRASE.toCharArray() );
+
+		TrustManagerFactory trustManager = TrustManagerFactory.getInstance(TRUST_NAME);
+		trustManager.init(store);
+		
+		sslContext.init(null, trustManager.getTrustManagers(), null);
+		
+		return sslContext;
+	}
+	
+	public void performHandshake(OutputStream oo, ByteBuffer cipherInput, CPLock lock) throws IOException, InterruptedException, NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, NoSuchMethodException, InstantiationException, InvocationTargetException, ClassNotFoundException, NoSuchAlgorithmException {
+		
+		if( ! useTLS)
+			return;
+		
+		engine.setEnabledProtocols( new String[]{SSL_CONTEXT_NAME});
+		
+		engine.beginHandshake();
+		
+		handshaker = new HandshakerCallback(engine);
+		
+		ByteBuffer clearOutput = ByteBuffer.allocate(0); clearOutput.flip();
+		cipherOutput.clear();
+		
+		byte [] buffer = new byte[BUFFER_SIZE];
+		
+		HandshakeStatus hs = engine.getHandshakeStatus();
+		SSLEngineResult res;
+		
+		int sent = 0;
+		int received = 0;
+		int nbSent = 0;
+		int nbReceived = 0;
+		
+		while ( true ) {
+			
+			switch (hs ) {
+			
+			case FINISHED:
+			case NOT_HANDSHAKING:
+				System.out.println("Handshake performed :\n"
+								 + "\tSent "+ nbSent +"*" + TLSUtils.TLS_HEADER_SIZE + "+" + sent + "="+ (nbSent*TLSUtils.TLS_HEADER_SIZE+sent)+" bytes to proxy.\n"
+								 + "\tReceived "+ nbReceived +"*" + TLSUtils.TLS_HEADER_SIZE + "+" + received + "="+ (nbReceived*TLSUtils.TLS_HEADER_SIZE+received)+" bytes to proxy.\n"
+								 + "\tTotal "+ (nbReceived+nbSent) +"*" + TLSUtils.TLS_HEADER_SIZE + "+" + (received+sent) + "="+ ( (nbReceived+nbSent)*TLSUtils.TLS_HEADER_SIZE+received+sent)+" bytes to proxy.");
+				return;
+			case NEED_TASK: {
+				
+				
+				Runnable task;
+				while ((task = engine.getDelegatedTask()) != null) {
+					task.run();
+				}
+				hs = engine.getHandshakeStatus();
+
+				break;
+			}
+			case NEED_UNWRAP: {
+				
+				if( lock.state() != CPLock.State.DOING_WORK)
+					lock.waitWork();
+				
+				clearInput.clear();
+				
+				res = engine.unwrap(cipherInput, clearInput);
+				hs = res.getHandshakeStatus();
+				
+				nbReceived++;
+				received += res.bytesConsumed() - TLSUtils.TLS_HEADER_SIZE;
+				
+				if( res.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW )
+					System.exit(0);
+				
+				if( ! cipherInput.hasRemaining() )
+					lock.workFinished();
+				break;
+			}
+			case NEED_WRAP: {
+				
+				res = engine.wrap(clearOutput, cipherOutput);
+				hs = res.getHandshakeStatus();
+				
+				cipherOutput.flip();
+				
+				int size = cipherOutput.remaining();
+				cipherOutput.get(buffer, 0, size);
+				
+				nbSent++;
+				sent += res.bytesProduced() - TLSUtils.TLS_HEADER_SIZE;
+				
+				oo.write( buffer, 0, size);
+				
+				cipherOutput.clear();
+				break;
+			}
+			}
+		}
+		
+	}
+	
+	private byte [] writeBuffer = new byte[BUFFER_SIZE];
+	
+	public void send(OutputStream oo, ByteBuffer clearOutput) throws IOException {
+
+		if( ! useTLS) {
+			int size = clearOutput.remaining();
+			clearOutput.get(writeBuffer, 0, size );
+			oo.write(writeBuffer, 0, size);
+			return;
+		}
+
+		cipherOutput.clear();
+		
+		engine.wrap(clearOutput, cipherOutput);
+		
+		cipherOutput.flip();
+		
+		int size = cipherOutput.remaining();
+		cipherOutput.get(writeBuffer, 0, size );
+		
+		oo.write(writeBuffer, 0, size);
+	}
+
+
+	private byte [] readBuffer = new byte[BUFFER_SIZE];
+
+	private HandshakerCallback handshaker;
+	
+	public void receive(OutputStream out, ByteBuffer cipherInput) throws SSLException {
+		
+		if( ! useTLS ) {
+			int size = cipherInput.remaining();
+			cipherInput.get(readBuffer, 0, size);
+			System.out.write(readBuffer, 0, size);
+			return;
+		}
+		
+		clearInput.clear();
+		
+		do {
+			engine.unwrap(cipherInput, clearInput);
+		} while( cipherInput.hasRemaining() ); //TODO secure
+		
+		clearInput.flip();
+		int size = clearInput.remaining();
+		clearInput.get(readBuffer, 0, size);
+		System.out.print( new String(readBuffer, 0, size, StandardCharsets.UTF_8) );
+	}
+
+	protected SSLEngine getInternalSSLEngine() {
+		return engine;
+	}
+
+	public void goStateT(byte[] buffer, int len) throws IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, ClassNotFoundException, IllegalBlockSizeException, BadPaddingException, NoSuchFieldException, IOException {
+		
+		Serialized serial = (Serialized) Serialization.fromBytes(buffer, 0, len);
+		
+		SSLSessionInfo pse = (SSLSessionInfo)Serialization.unserialize(serial);
+		engine = Introspection.createSEFromSSLSI(pse, engine);
+	}
+
+	public byte[] goStateP() throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, IOException, InstantiationException, NoSuchMethodException, InvocationTargetException {
+		Introspection.SSLSessionInfo pse = Introspection.extractSSLSIfromSE( engine );
+		Serialized serial = Serialization.serialize(pse);
+		return Serialization.toBytes(serial);
+	}
+
+	public void goStateT2(byte[] seq_num, int size) throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+		
+		Object readMAC = Introspection.extract(engine, "readMAC");
+		Object writeMAC = Introspection.extract(engine, "writeMAC");
+		
+		byte [] readBlock = (byte[])Introspection.extract(readMAC, "block");
+		byte [] writeBlock = (byte[])Introspection.extract(writeMAC, "block");
+		
+		int len = size/2;
+		int offset = 8 - len;
+		
+		System.arraycopy(seq_num, 0, readBlock, offset, len);
+		System.arraycopy(seq_num, len, writeBlock, offset, len);
+		
+	}
+
+	public HandshakerCallback getHandshakerCallback() {
+		
+		return handshaker;
+	}
+}

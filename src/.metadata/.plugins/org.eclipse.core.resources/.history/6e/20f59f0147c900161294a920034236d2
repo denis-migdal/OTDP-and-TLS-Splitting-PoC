@@ -1,0 +1,300 @@
+package proxy;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.NoSuchAlgorithmException;
+
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import shared.CPLock;
+import shared.TLSUtils;
+import shared.Values;
+import shared.TLSUtils.TLS_State;
+import shared.Values.Switch_mode;
+
+public class Proxy {
+
+	private SSLProxyEngine engine = new SSLProxyEngine();
+	
+	private Values.Switch_mode _switch_mode;
+	
+	public Proxy(Switch_mode switch_mode) {
+		_switch_mode = switch_mode;
+	}
+
+	public void start(int port) throws UnknownHostException, IOException, ClassNotFoundException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, IllegalBlockSizeException, BadPaddingException, NoSuchFieldException, InterruptedException, NoSuchAlgorithmException {
+		connectTrusted(port);
+	}
+	
+	private Socket trustedSocket = null;
+	private Socket serverSocket = null;
+	
+	private ByteBuffer trustedBuffer = ByteBuffer.allocate(Values.BIG_BUFFER_SIZE);
+	private ByteBuffer serverBuffer = ByteBuffer.allocate(Values.BUFFER_SIZE);
+	private ByteBuffer commdBuffer = ByteBuffer.allocate(Values.BUFFER_SIZE);
+	
+	private CPLock trustedLock = new CPLock();
+	private CPLock serverLock = new CPLock();
+	private CPLock commdLock = new CPLock();
+	
+	private TLS_State current_state = TLS_State.StateT;
+	
+	private Thread serverThread;
+	private Thread commdThread;
+	
+	protected void connectTrusted(int port) throws UnknownHostException, IOException, ClassNotFoundException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, IllegalBlockSizeException, BadPaddingException, NoSuchFieldException, InterruptedException, NoSuchAlgorithmException {
+		
+		ServerSocket listenner = new ServerSocket(port);
+		
+		trustedSocket = listenner.accept();
+		connectServer();
+		
+		InputStream server_io = serverSocket.getInputStream();
+		InputStream trusted_io = trustedSocket.getInputStream();
+		
+		TLSUtils.startReadThread(System.in,  commdBuffer, commdLock);
+		TLSUtils.startReadRecordThread(trusted_io, trustedBuffer, trustedLock);
+		TLSUtils.startReadRecordThread(server_io,  serverBuffer,  serverLock);
+
+		do {
+			
+			startCommdThread();
+			startServerThread();
+			
+			startTrustedLoop();
+			
+			joinThreads();
+			
+			switch(current_state) {
+			case StateT:
+				sendPartialSSLEngineToTrusted();
+				break;
+			case StateT2:
+				byte [] seq_num = engine.extractSequenceNumbers();
+				sendSequenceNumbersToTrusted(seq_num);
+				current_state = TLS_State.StateT;
+				break;
+			case StateP:
+				readPartialSSLEngineFromTrusted();
+				break;
+			default:
+				break;
+			}
+			
+		} while( current_state != TLS_State.Close );
+		
+		TLSUtils.joinReadThreads();
+		
+		trustedSocket.close();
+		listenner.close();
+	}
+
+	private void sendSequenceNumbersToTrusted(byte[] seq_num) throws IOException {
+		
+		byte [] buffer = new byte [ TLSUtils.TLS_HEADER_SIZE + seq_num.length];
+		buffer[0] = 'T';
+		
+		TLSUtils.writeSizeToRecordHeader(buffer, seq_num.length);
+		
+		System.arraycopy(seq_num, 0, buffer, TLSUtils.TLS_HEADER_SIZE, seq_num.length);
+
+		OutputStream oo = trustedSocket.getOutputStream();
+		oo.write(buffer);
+	}
+
+
+	private void connectServer() throws IOException {
+
+		InputStream io = trustedSocket.getInputStream();
+		
+		byte [] buffer = new byte[Values.BUFFER_SIZE];
+		
+		int size = io.read();
+		io.read(buffer, 0, size);
+		
+		int sep = size - 1;
+		for( int i = 0 ; i < size ; ++i)
+			if( buffer[i] == ':')
+				sep = i;
+			
+		String serverHost = new String(buffer, 0, sep, StandardCharsets.UTF_8);
+		int serverPort = Integer.parseInt( new String(buffer, sep + 1, size - sep - 1, StandardCharsets.UTF_8) );
+		
+		serverSocket = new Socket(serverHost, serverPort);
+	}
+	
+	private byte [] readTrustedBuffer = new byte[Values.BIG_BUFFER_SIZE];
+	
+	private void startTrustedLoop() throws InterruptedException, IOException, ClassNotFoundException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, IllegalBlockSizeException, BadPaddingException, NoSuchFieldException, NoSuchAlgorithmException {
+		
+		byte reqType;
+		
+		do {
+			
+			trustedLock.waitWork();
+			
+			reqType = trustedBuffer.get(0);
+			
+			switch( reqType ) {
+			case 't':
+				current_state = TLS_State.StateT;
+				break;
+			case 'T':
+				current_state = TLS_State.StateT2;
+				break;
+			case 'p': {
+				
+				current_state = TLS_State.StateP;
+				int size = trustedBuffer.remaining();
+				trustedBuffer.get(readTrustedBuffer, 0, size);
+				engine.goStateP(readTrustedBuffer, TLSUtils.TLS_HEADER_SIZE, size - TLSUtils.TLS_HEADER_SIZE);
+				
+				System.out.println("State P");
+				
+				break;
+			}
+			case 'P': {
+				current_state = TLS_State.StateP;
+				int size = trustedBuffer.remaining();
+				trustedBuffer.get(readTrustedBuffer, 0, size);
+				engine.goStateP2(readTrustedBuffer, 0, size);
+				
+				System.out.println("State P");
+				
+				break;
+			}
+			case TLSUtils.ALERT_RECORD:
+			case TLSUtils.APP_DATA_RECORD:
+			case TLSUtils.CHANGE_CIPHER_SPEC_RECORD:
+			case TLSUtils.HANDSHAKE_RECORD: {
+				
+				int size = trustedBuffer.remaining();
+				trustedBuffer.get(readTrustedBuffer, 0, size);
+				serverSocket.getOutputStream().write(readTrustedBuffer, 0, size);
+				
+				reqType = 's';
+				break;
+			}
+			case 'e':
+				current_state = TLS_State.Close;
+				break;
+			default :
+				assert false : "Unkown record type " + (int)reqType;
+				break;
+			}
+			
+			trustedLock.workFinished();
+			
+		} while(reqType == 's');
+	}
+	
+	private void sendPartialSSLEngineToTrusted() throws IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, SecurityException, InvocationTargetException, NoSuchFieldException, IOException {
+
+		OutputStream oo = trustedSocket.getOutputStream();
+		
+		byte [] data = engine.goStateT();
+		
+		TLSUtils.writeSizeToRecordHeader(STATE_T_HEADER, data.length);
+		
+		byte [] toWrite = new byte[5 + data.length];
+		
+		System.arraycopy(STATE_T_HEADER, 0, toWrite, 0, STATE_T_HEADER.length);
+		System.arraycopy(data, 0, toWrite, 5, data.length);
+		
+		oo.write(toWrite);
+	}
+	
+	private void readPartialSSLEngineFromTrusted() {
+		// done in startTrustedLoop
+	}
+	
+	private static byte [] STATE_T_HEADER = {'t', 0,0,0,0};
+	
+	
+	private void startCommdThread() {
+		
+		commdThread = new Thread() {
+			
+			@Override
+			public void run() {
+
+				try {
+					
+					do {
+						
+						commdLock.waitWork();
+						
+						if( current_state == TLS_State.StateP )
+							engine.send( serverSocket.getOutputStream(), commdBuffer);
+						else {
+							System.out.println("You need to be in state P to write to the server !"); // TODO : wait for state P
+						}
+						
+						commdLock.workFinished();
+						
+					} while( true );
+					
+				} catch (IOException e) {
+					e.printStackTrace();
+					assert false;
+				} catch ( InterruptedException e) { }
+			}
+		};
+		
+		commdThread.start();
+	}
+	
+	private byte [] trustedWriteBuffer = new byte[Values.BUFFER_SIZE];
+	
+	private void startServerThread() {
+		
+		serverThread = new Thread() {
+			
+			@Override
+			public void run() {
+
+				try {
+					
+					do {
+						serverLock.waitWork();
+						
+						if( current_state == TLS_State.StateP ) {
+							engine.receive(System.out, serverBuffer);
+						} else {
+							int size = serverBuffer.remaining();
+							serverBuffer.get(trustedWriteBuffer, 0, size);
+							trustedSocket.getOutputStream().write(trustedWriteBuffer, 0, size);
+						}
+						
+						serverLock.workFinished();
+						
+					} while(true);
+
+				} catch (IOException e) {
+					e.printStackTrace();
+					assert false;
+				} catch (InterruptedException e) {}
+			}
+		};
+		
+		serverThread.start();
+		
+	}
+	
+	private void joinThreads() throws InterruptedException {
+		
+		serverThread.interrupt();
+		commdThread.interrupt();
+		
+		serverThread.join();
+		commdThread.join();
+	}
+	
+}

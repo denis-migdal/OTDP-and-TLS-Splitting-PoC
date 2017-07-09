@@ -1,0 +1,13 @@
+package shared;
+
+public class Values {
+
+	final static public int BUFFER_SIZE = 4096;
+	final static public int BIG_BUFFER_SIZE = 15*1024;
+	final static public boolean USE_TLS = true;
+	final static public String SSL_CONTEXT_NAME = "TLSv1.2";//"TLS";
+	final static public String KEYSTORE_TYPE = "JKS";	
+	final static public String TRUST_FILE = /**/ "/mnt/keystore/myTrustStore"; //*/"/home/user/trustStore";
+	final static public String TRUST_FILE_PASSPHRASE = "123456";
+	final static public String TRUST_NAME = "SunX509";
+}

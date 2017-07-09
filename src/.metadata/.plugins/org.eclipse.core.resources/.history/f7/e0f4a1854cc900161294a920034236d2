@@ -1,0 +1,187 @@
+package shared;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import java.util.Map;
+import java.util.TreeMap;
+import javassist.CannotCompileException;
+import javassist.NotFoundException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import proxy.Proxy;
+import trusted.Trusted;
+
+public class main {
+
+	
+	private static void usage() {
+		
+		System.out.println("tlsswitch help|proxy|trusted|server|init [options...]");
+		System.out.println(	"\ttlsswitch init : show commands to initialize TLS certificates.");
+		System.out.println(	"\ttlsswitch server : show commands to launch a TLS server.");
+		System.out.println(	"\ttlsswitch proxy : launch a TLS Switching proxy.");
+		System.out.println(	"\ttlsswitch trusted : launch a TLS Switching trusted service.");
+
+		System.out.println(	"\n");
+		System.out.println(	"\ttlsswitch init");
+		System.out.println(	"\ttlsswitch server : show commands to launch a TLS server.");
+		System.out.println(	"\t\ttlsswitch proxy [--proxy-port port] [--initial-state StateT]");
+		System.out.println(	"\t\ttlsswitch trusted [--proxy-ip ip] [--proxy-port port] [--server-ip ip] [--server-port port] [--switch-mode naive|normal]");
+	}
+	
+	private static void bad_usage() {
+		
+		System.err.println("Bad usage");
+		
+		usage();
+		
+		System.exit(1);
+	}
+	
+	/**
+	 * @param args
+	 * @throws IOException 
+	 * @throws KeyStoreException 
+	 * @throws FileNotFoundException 
+	 * @throws CertificateException 
+	 * @throws NoSuchAlgorithmException 
+	 * @throws KeyManagementException 
+	 * @throws CannotCompileException 
+	 * @throws NotFoundException 
+	 * @throws InterruptedException 
+	 * @throws BadPaddingException 
+	 * @throws IllegalBlockSizeException 
+	 * @throws ClassNotFoundException 
+	 * @throws InvocationTargetException 
+	 * @throws NoSuchMethodException 
+	 * @throws InstantiationException 
+	 * @throws IllegalAccessException 
+	 * @throws IllegalArgumentException 
+	 * @throws SecurityException 
+	 * @throws NoSuchFieldException 
+	 */
+	public static void main(String[] args) throws KeyManagementException, NoSuchAlgorithmException, CertificateException, FileNotFoundException, KeyStoreException, IOException, NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, InstantiationException, NoSuchMethodException, InvocationTargetException, ClassNotFoundException, IllegalBlockSizeException, BadPaddingException, InterruptedException, NotFoundException, CannotCompileException {
+		
+		if(args.length < 1 || args.length%2 != 1)
+			bad_usage();
+		
+		String command = args[0];
+		
+		if(command.equals("help")) {
+			usage();
+			return;
+		}
+		
+		Map<String, String> arguments = new TreeMap<String, String>();
+		
+		arguments.put("--proxy-ip", "127.0.0.1"); // trusted
+		arguments.put("--proxy-port", "8000"); // proxy + trusted
+		arguments.put("--server-ip", "127.0.0.1"); // trusted+server
+		arguments.put("--server-port", "8001"); // trusted+server
+		arguments.put("--switch-mode", "normal"); // only trusted
+		arguments.put("--initial-state", "StateT"); // proxy
+		
+		for(int i = 1 ; i < args.length ; i +=2) {
+			
+			String option_name = null;
+			
+			switch(args[i]) {
+			case "--proxy-ip":
+				option_name = "--proxy_ip";
+				break;
+			case "--proxy-port":
+				option_name = "--proxy_port";
+				break;
+			case "--server-ip":
+				option_name = "--server_ip";
+				break;
+			case "--server-port":
+				option_name = "--server_port";
+				break;
+			case "--switch-mode":
+				option_name = "--switch-mode";
+			default:
+					bad_usage();
+			}
+			
+			arguments.put(option_name, args[i+1]);
+		}
+		
+
+		String proxy_ip = arguments.get("--proxy-ip");
+		String server_ip = arguments.get("--server-ip");
+		
+		
+		int proxy_port = 0;
+		int server_port = 0;
+		
+		try{
+			proxy_port = Integer.parseInt(arguments.get("--proxy-port"));
+			server_port = Integer.parseInt(arguments.get("--server-port"));
+			
+			if(proxy_port < 0 || proxy_port >= 1<<16 || server_port < 0 || server_port >= 1<<16)
+				throw new NumberFormatException();
+		} catch(NumberFormatException e) {
+			System.err.println("Invalid port number.");
+			bad_usage();
+		}
+		
+		
+		Values.Switch_mode  switch_mode = Values.Switch_mode.normal;
+		try {
+			switch_mode = Values.Switch_mode.valueOf( arguments.get("--switch-mode") );
+		} catch(IllegalArgumentException e) {
+			System.err.println("Switch mode " + arguments.get("--switch-mode") + " not implemented !");
+			bad_usage();
+		}
+			
+		
+		TLSUtils.TLS_State  initial_state = TLSUtils.TLS_State.StateT;
+		try {
+			initial_state = TLSUtils.TLS_State.valueOf( arguments.get("--initial-state") );
+			
+			if( initial_state != TLSUtils.TLS_State.StateT )
+				throw new IllegalArgumentException();
+			
+		} catch(IllegalArgumentException e) {
+			System.err.println("Initial state " + arguments.get("--initial-state") + " not implemented !");
+			bad_usage();
+		}
+		
+		switch(command) {
+		
+		case "trusted":
+			//modifyHandshaker();
+			Trusted t = new Trusted(proxy_ip, proxy_port, switch_mode);
+			t.start(server_ip, server_port);
+			break;
+		case "proxy":
+			Proxy p = new Proxy(initial_state);
+			p.start(proxy_port);
+			break;
+		case "init":
+			System.err.println("Command init not implemented !");
+			System.err.println("Use the command-lines :");
+			System.err.println("openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -passout pass:123456");
+			System.err.println("keytool -import -file cert.pem -alias firstCA -keystore trustStore -storepass 123456");
+			System.exit(2);
+			break;
+		case "server":
+			System.err.println("Command server not implemented !");
+			System.err.println("Use the command-line :");
+			System.err.println("openssl s_server -accept server_port -key key.pem -cert cert.pem -pass pass:123456");
+			System.exit(2);
+			break;
+		default:
+				System.err.println("Command " + command + " not implemented !");
+				bad_usage();
+		}
+
+	}
+
+}

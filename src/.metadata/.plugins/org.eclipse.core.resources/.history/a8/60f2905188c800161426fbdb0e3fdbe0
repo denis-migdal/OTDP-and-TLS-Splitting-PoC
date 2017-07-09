@@ -1,0 +1,468 @@
+package shared;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+import javax.net.ssl.SSLEngine;
+
+public class Introspection {
+
+
+	static public class SSLSessionInfo {
+		public boolean isFirstAppOutputRecord;
+
+		Object readMAC;
+		Object writeMAC;
+		
+		Object readCipher;
+		Object writeCipher;
+		
+		public boolean acceptLargeFragments;
+	}
+	
+	static public SSLSessionInfo extractSSLSIfromSE(SSLEngine se) throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+		
+		SSLSessionInfo sslSI = new SSLSessionInfo();
+		
+		sslSI.isFirstAppOutputRecord = (boolean) extract(se, "isFirstAppOutputRecord");
+		sslSI.readMAC = extract(se, "readMAC");
+		sslSI.writeMAC = extract(se, "writeMAC");
+
+		sslSI.readCipher = extract(se, "readCipher");
+		sslSI.writeCipher = extract(se, "writeCipher");
+		
+		sslSI.acceptLargeFragments = (boolean) extract( extract(se, "sess"), "acceptLargeFragments");
+		
+		return sslSI;
+	}
+	
+
+	static public void set( Object a, String fieldname, Object o) throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+		
+		Class<?> c = a.getClass();
+		Field field = getField(c, fieldname);
+		
+		if( field == null) {
+			
+			System.err.println("Reserched : " + fieldname);
+			
+			for(Field f : getAllFields(c) )
+				System.err.println(f.getName());
+			
+			throw new RuntimeException("Field does not exists !");
+			
+		}
+		
+		field.setAccessible(true);
+		field.set(a, o);
+		field.setAccessible(false);
+	}
+
+	static public Object extract( Object a, String fieldname) throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+		
+		Class<?> c = a.getClass();
+		Field field = getField(c, fieldname);
+		
+		field.setAccessible(true);
+		Object o = field.get(a);
+		field.setAccessible(false);
+		
+		return o;
+	}
+	
+	public static Field getField(Class<?> c, String name ) {
+		
+		Field field = null;
+		
+		while( field == null && c != null && c != Object.class) {
+			
+			try {
+				field = c.getDeclaredField(name);
+			} catch (NoSuchFieldException e) {}
+			
+			c = c.getSuperclass();
+		}
+		
+		return field;
+	}
+	
+	public static void printAllMethods(Class<?> c) {
+		
+		while( c != null && c != Object.class) {
+			
+			System.out.println(c.getName());
+			
+			for(Method m : c.getDeclaredMethods() ) {
+				System.out.print(m.getName() + "(");
+				for(Class<?> t : m.getParameterTypes() )
+					System.out.print(t.getName() + ", ");
+				System.out.println(")");
+			}
+			
+			c = c.getSuperclass();
+		}
+		
+	}
+	
+	public static void printAllConstructors(Class<?> c) {
+		
+		for(Constructor<?> ctr : c.getDeclaredConstructors() ) {
+				System.out.print(ctr.getName() + "(");
+				for(Class<?> t : ctr.getParameterTypes() )
+					System.out.print(t.getName() + ", ");
+				System.out.println(")");
+		}
+	}
+	
+	public static Method getMethod(Class<?> c, String name, Class<?> ...parameterTypes) {
+		
+		Method method = null;
+		
+		while( method == null && c != null && c != Object.class) {
+			
+			try {
+				method = c.getDeclaredMethod(name, parameterTypes);
+			} catch (NoSuchMethodException e) {}
+			
+			c = c.getSuperclass();
+		}
+		
+		return method;
+	}
+	
+	public static Object invoke(Object o, Method m, Object ... args) throws IllegalAccessException, IllegalArgumentException, InvocationTargetException {
+	
+		m.setAccessible(true);
+		Object return_value = m.invoke(o, args);
+		m.setAccessible(false);
+		
+		return return_value;
+	}
+	
+
+	public static ArrayList<Field> getAllFields(Class<?> c ) {
+		
+		ArrayList<Field> fields = new ArrayList<Field>();
+		
+		while( c != null && c != Object.class) {
+			
+			fields.addAll( Arrays.asList( c.getDeclaredFields() ) );
+			c = c.getSuperclass();
+		}
+		
+		return fields;
+	}
+	
+	
+	public static SSLEngine createSEFromSSLSI(SSLSessionInfo sslSI) throws NoSuchMethodException, SecurityException, InstantiationException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, ClassNotFoundException, NoSuchFieldException {
+		
+		Object b = allocate( Class.forName("sun.security.ssl.SSLEngineImpl") );
+		
+		return createSEFromSSLSI(sslSI, (SSLEngine)b);
+	}
+	
+	private static Object protocolVersion() throws ClassNotFoundException, IllegalAccessException, IllegalArgumentException, InvocationTargetException {
+		
+		Class<?> c = Class.forName("sun.security.ssl.ProtocolVersion");
+		Method m = Introspection.getMethod(c, "valueOf", String.class);
+		
+		return Introspection.invoke(null, m, Values.SSL_CONTEXT_NAME);
+	}
+	
+	public static SSLEngine createDummySE() throws NoSuchMethodException, SecurityException, InstantiationException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, ClassNotFoundException, NoSuchFieldException {
+
+		Class<?> c = Class.forName("sun.security.ssl.SSLEngineImpl");
+		Object engine = allocate( c );
+		
+		Object protocolVersion = protocolVersion();
+		
+		for( Field f : getAllFields(c) ) {
+			
+			if( java.lang.reflect.Modifier.isStatic(f.getModifiers() ) )
+				continue;
+			
+			f.setAccessible(true);
+			
+			switch(f.getName()) {
+			
+			case "connectionState": {
+				Field cs = c.getDeclaredField("cs_DATA");
+				cs.setAccessible(true);
+				f.set(engine, cs.get(engine) );
+				cs.setAccessible(false);
+				
+				break;
+			}
+			case "inboundDone":
+			case "expectingFinished":
+			case "recvCN":
+			case "serverModeSet":
+			case "roleIsServer":{
+				f.set(engine, false );
+				break;
+			}
+			
+			case "wrapLock":
+			case "unwrapLock":
+			case "writeLock": {
+				f.set(engine, new Object() );
+				break;
+			}
+			
+			case "sslContext":
+			case "handshaker":
+			case "closeReason":
+			case "doClientAuth":
+			case "enabledCipherSuites":
+			case "enabledSessionCreation":
+			case "enableSessionCreation":
+			case "acc":
+			case "identificationAlg":
+			case "identificationProtocol":
+			case "enabledProtocols":
+			case "protocolVersion":
+			case "peerHost":
+			case "peerPort":
+			case "algorithmConstraints":
+			case "handshakeSession":
+			case "secureRenegotiation":
+			case "clientVerifyData":
+			case "serverVerifyData":
+			case "receivedCCS":
+				break;
+				
+			case "isFirstAppOutputRecord":
+				set(engine, "isFirstAppOutputRecord", true); //TODO not sure
+				break;
+				
+			case "writer": {
+				Constructor<?> cstr = Class.forName("sun.security.ssl.EngineWriter").getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				set(engine, "writer", cstr.newInstance() );
+				cstr.setAccessible(false);
+				break;
+			}
+
+			case "outputRecord": {// carefull use writer
+				
+				byte type;
+				
+				Class<?> outputRecord = Class.forName("sun.security.ssl.Record");
+				Field ct_app_data = outputRecord.getDeclaredField("ct_application_data");
+				ct_app_data.setAccessible(true);
+				type = (byte) ct_app_data.get(null);
+				ct_app_data.setAccessible(false);
+				
+				Class<?> engineOutputRecordClass = Class.forName("sun.security.ssl.EngineOutputRecord");
+				Constructor<?> cstr = engineOutputRecordClass.getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				Object outputRecordObject =  cstr.newInstance( type , engine);
+				set(engine, "outputRecord", outputRecordObject );
+				cstr.setAccessible(false);
+				
+				Method m = getMethod(engineOutputRecordClass, "setVersion", Class.forName("sun.security.ssl.ProtocolVersion"));
+				invoke(outputRecordObject, m, protocolVersion);
+				
+				break;
+			}
+			
+			case "inputRecord": {
+				
+				Constructor<?> cstr = Class.forName("sun.security.ssl.EngineInputRecord").getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				set(engine, "inputRecord", cstr.newInstance(engine) );
+				cstr.setAccessible(false);
+				break;
+			}
+			
+			case "readMAC":
+			case "writeMAC":
+			case "readCipher":
+			case "writeCipher":
+				break; // need to be fill before (un)wrapping
+				
+			case "sess": {
+				
+				f.setAccessible(true);
+				
+				Object obj = allocate( Class.forName("sun.security.ssl.SSLSessionImpl"));
+				
+				set(obj, "acceptLargeFragments", false); //TODO not sure
+				
+				f.set(engine, obj);
+				
+				f.setAccessible(false);
+			
+				break;
+			}
+			default:
+				assert false : "Unkown field : " + f.getName();
+			}
+
+			f.setAccessible(false);
+			
+		}
+		
+		return (SSLEngine)engine;
+	}
+	
+	public static  SSLEngine createSEFromSSLSI(SSLSessionInfo sslSI, SSLEngine b) throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException, InstantiationException, ClassNotFoundException, InvocationTargetException, NoSuchMethodException {
+		
+		Class<?> c = b.getClass();
+		
+		Object protocolVersion = protocolVersion();
+		
+		for( Field f : getAllFields(c) ) {
+			
+			if( java.lang.reflect.Modifier.isStatic(f.getModifiers() ) )
+				continue;
+			
+			f.setAccessible(true);
+			
+			switch(f.getName()) {
+			
+			case "connectionState": {
+				Field cs = c.getDeclaredField("cs_DATA");
+				cs.setAccessible(true);
+				f.set(b, cs.get(b) );
+				cs.setAccessible(false);
+				
+				break;
+			}
+			case "inboundDone":
+			case "expectingFinished":
+			case "recvCN":
+			case "serverModeSet":
+			case "roleIsServer":{
+				f.set(b, false );
+				break;
+			}
+			
+			case "wrapLock":
+			case "unwrapLock":
+			case "writeLock": {
+				f.set(b, new Object() );
+				break;
+			}
+			
+			case "sslContext":
+			case "handshaker":
+			case "closeReason":
+			case "doClientAuth":
+			case "enabledCipherSuites":
+			case "enabledSessionCreation":
+			case "enableSessionCreation":
+			case "acc":
+			case "identificationAlg":
+			case "identificationProtocol":
+			case "enabledProtocols":
+			case "protocolVersion":
+			case "peerHost":
+			case "peerPort":
+			case "algorithmConstraints":
+			case "handshakeSession":
+			case "secureRenegotiation":
+			case "clientVerifyData":
+			case "serverVerifyData":
+			case "receivedCCS":
+				break;
+				
+			case "isFirstAppOutputRecord":
+				set(b, "isFirstAppOutputRecord", sslSI.isFirstAppOutputRecord);
+				break;
+				
+			case "writer": {
+				Constructor<?> cstr = Class.forName("sun.security.ssl.EngineWriter").getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				set(b, "writer", cstr.newInstance() );
+				cstr.setAccessible(false);
+				break;
+			}
+
+			case "outputRecord": {// carefull use writer
+				
+				byte type;
+				
+				Class<?> outputRecord = Class.forName("sun.security.ssl.Record");
+				Field ct_app_data = outputRecord.getDeclaredField("ct_application_data");
+				ct_app_data.setAccessible(true);
+				type = (byte) ct_app_data.get(null);
+				ct_app_data.setAccessible(false);
+				
+				Class<?> engineOutputRecordClass = Class.forName("sun.security.ssl.EngineOutputRecord");
+				Constructor<?> cstr = engineOutputRecordClass.getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				Object outputRecordObject =  cstr.newInstance( type , b);
+				set(b, "outputRecord", outputRecordObject );
+				cstr.setAccessible(false);
+				
+				Method m = getMethod(engineOutputRecordClass, "setVersion", Class.forName("sun.security.ssl.ProtocolVersion"));
+				invoke(outputRecordObject, m, protocolVersion);
+				
+				break;
+			}
+			
+			case "inputRecord": {
+				
+				Constructor<?> cstr = Class.forName("sun.security.ssl.EngineInputRecord").getDeclaredConstructors()[0];
+				cstr.setAccessible(true);
+				set(b, "inputRecord", cstr.newInstance(b) );
+				cstr.setAccessible(false);
+				break;
+			}
+			
+			case "readMAC":
+				set(b, f.getName(), sslSI.readMAC);
+				break;
+			case "writeMAC":
+				set(b, f.getName(), sslSI.writeMAC);
+				break;
+			case "readCipher":
+				set(b, f.getName(), sslSI.readCipher);
+				break;
+			case "writeCipher":
+				set(b, f.getName(), sslSI.writeCipher);
+				break;
+				
+			case "sess": {
+				
+				f.setAccessible(true);
+				
+				Object obj = allocate( Class.forName("sun.security.ssl.SSLSessionImpl"));
+				
+				set(obj, "acceptLargeFragments", sslSI.acceptLargeFragments);
+				
+				f.set(b, obj);
+				
+				f.setAccessible(false);
+			
+				break;
+			}
+			default:
+				assert false : "Unkown field : " + f.getName();
+			}
+
+			f.setAccessible(false);
+			
+		}
+		
+		return b;
+	}
+	
+	// VM dependant.
+	@SuppressWarnings({ "unchecked", "restriction" })
+	public static Object allocate( Class<?> c ) throws NoSuchMethodException, SecurityException, InstantiationException, IllegalAccessException, IllegalArgumentException, InvocationTargetException {
+
+		sun.reflect.ReflectionFactory reflection = sun.reflect.ReflectionFactory.getReflectionFactory();
+		
+		final Constructor<Object> constructor = 
+				reflection.newConstructorForSerialization(c, Object.class.getDeclaredConstructor(new Class[0]));
+		final Object o = constructor.newInstance(new Object[0]);
+
+		return o;
+	}
+}
