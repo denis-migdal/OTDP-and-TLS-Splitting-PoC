@@ -2,7 +2,7 @@
 
 Current PoC requires an OffPAD, and a rooted Android phone (sources not availables).
 
-PoC are currently being rewritten and refactored for PCs. TLS Switching demo with will be available soon.
+PoC are currently being rewritten and refactored for PCs. TLS Switching demo and documentations will be available soon.
 
 ***********
 
